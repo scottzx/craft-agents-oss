@@ -1065,7 +1065,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
 
   // Recursive directory scanner for session files
   // Filters out internal files (session.jsonl) and hidden files (. prefix)
-  // Returns only non-empty directories
+  // Returns only non-empty directories (for session files - skips hidden files)
   async function scanSessionDirectory(dirPath: string): Promise<import('../shared/types').SessionFile[]> {
     const { readdir, stat } = await import('fs/promises')
     const entries = await readdir(dirPath, { withFileTypes: true })
@@ -1089,6 +1089,46 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
             children,
           })
         }
+      } else {
+        const stats = await stat(fullPath)
+        files.push({
+          name: entry.name,
+          path: fullPath,
+          type: 'file',
+          size: stats.size,
+        })
+      }
+    }
+
+    // Sort: directories first, then alphabetically
+    return files.sort((a, b) => {
+      if (a.type !== b.type) return a.type === 'directory' ? -1 : 1
+      return a.name.localeCompare(b.name)
+    })
+  }
+
+  // Scan directory including hidden files (for working directory)
+  async function scanDirectoryWithHidden(dirPath: string): Promise<import('../shared/types').SessionFile[]> {
+    const { readdir, stat } = await import('fs/promises')
+    const entries = await readdir(dirPath, { withFileTypes: true })
+    const files: import('../shared/types').SessionFile[] = []
+
+    for (const entry of entries) {
+      // Skip only session.jsonl for working directories
+      if (entry.name === 'session.jsonl') continue
+
+      const fullPath = join(dirPath, entry.name)
+
+      if (entry.isDirectory()) {
+        // Recursively scan subdirectory
+        const children = await scanDirectoryWithHidden(fullPath)
+        // Include all directories, even empty ones
+        files.push({
+          name: entry.name,
+          path: fullPath,
+          type: 'directory',
+          children,
+        })
       } else {
         const stats = await stat(fullPath)
         files.push({
@@ -1225,12 +1265,12 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   let watchedDirectoryPath: string | null = null
   let directoryChangeDebounceTimer: ReturnType<typeof setTimeout> | null = null
 
-  // Get files in working directory (recursive tree structure)
+  // Get files in working directory (recursive tree structure, includes hidden files)
   ipcMain.handle(IPC_CHANNELS.GET_WORKING_DIRECTORY_FILES, async (_event, dirPath: string) => {
     if (!dirPath) return []
 
     try {
-      return await scanSessionDirectory(dirPath)
+      return await scanDirectoryWithHidden(dirPath)
     } catch (error) {
       ipcLog.error('Failed to get working directory files:', error)
       return []
@@ -1256,11 +1296,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     try {
       const { watch } = await import('fs')
       directoryFileWatcher = watch(dirPath, { recursive: true }, (eventType, filename) => {
-        // Ignore hidden files
-        if (filename && filename.startsWith('.')) {
-          return
-        }
-
+        // Monitor all files including hidden files (no filtering)
         // Debounce: wait 100ms before notifying to batch rapid changes
         if (directoryChangeDebounceTimer) {
           clearTimeout(directoryChangeDebounceTimer)
