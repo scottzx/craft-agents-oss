@@ -1216,6 +1216,87 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     }
   })
 
+  // ============================================================
+  // Working Directory Files
+  // ============================================================
+
+  // Directory file watcher state - only one directory watched at a time
+  let directoryFileWatcher: import('fs').FSWatcher | null = null
+  let watchedDirectoryPath: string | null = null
+  let directoryChangeDebounceTimer: ReturnType<typeof setTimeout> | null = null
+
+  // Get files in working directory (recursive tree structure)
+  ipcMain.handle(IPC_CHANNELS.GET_WORKING_DIRECTORY_FILES, async (_event, dirPath: string) => {
+    if (!dirPath) return []
+
+    try {
+      return await scanSessionDirectory(dirPath)
+    } catch (error) {
+      ipcLog.error('Failed to get working directory files:', error)
+      return []
+    }
+  })
+
+  // Start watching a directory for file changes
+  ipcMain.handle(IPC_CHANNELS.WATCH_DIRECTORY_FILES, async (_event, dirPath: string) => {
+    if (!dirPath) return
+
+    // Close existing watcher if watching a different directory
+    if (directoryFileWatcher) {
+      directoryFileWatcher.close()
+      directoryFileWatcher = null
+    }
+    if (directoryChangeDebounceTimer) {
+      clearTimeout(directoryChangeDebounceTimer)
+      directoryChangeDebounceTimer = null
+    }
+
+    watchedDirectoryPath = dirPath
+
+    try {
+      const { watch } = await import('fs')
+      directoryFileWatcher = watch(dirPath, { recursive: true }, (eventType, filename) => {
+        // Ignore hidden files
+        if (filename && filename.startsWith('.')) {
+          return
+        }
+
+        // Debounce: wait 100ms before notifying to batch rapid changes
+        if (directoryChangeDebounceTimer) {
+          clearTimeout(directoryChangeDebounceTimer)
+        }
+        directoryChangeDebounceTimer = setTimeout(() => {
+          // Notify all windows that directory files changed
+          const { BrowserWindow } = require('electron')
+
+          BrowserWindow.getAllWindows().forEach((win) => {
+            if (!win.isDestroyed()) {
+              win.webContents.send(IPC_CHANNELS.DIRECTORY_FILES_CHANGED, dirPath)
+            }
+          })
+        }, 100)
+      })
+
+      ipcLog.info(`Started watching directory: ${dirPath}`)
+    } catch (error) {
+      ipcLog.error('Failed to watch directory:', error)
+    }
+  })
+
+  // Stop watching directory files
+  ipcMain.handle(IPC_CHANNELS.UNWATCH_DIRECTORY_FILES, async () => {
+    if (directoryFileWatcher) {
+      directoryFileWatcher.close()
+      directoryFileWatcher = null
+      ipcLog.info('Stopped watching directory')
+    }
+    if (directoryChangeDebounceTimer) {
+      clearTimeout(directoryChangeDebounceTimer)
+      directoryChangeDebounceTimer = null
+    }
+    watchedDirectoryPath = null
+  })
+
   // Preview windows removed - now using in-app overlays (see ChatDisplay.tsx)
 
   // ============================================================

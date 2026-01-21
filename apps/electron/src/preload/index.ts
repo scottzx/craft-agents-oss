@@ -211,6 +211,16 @@ const api: ElectronAPI = {
     return () => ipcRenderer.removeListener(IPC_CHANNELS.SESSION_FILES_CHANGED, handler)
   },
 
+  // Working Directory Files
+  getWorkingDirectoryFiles: (path: string) => ipcRenderer.invoke(IPC_CHANNELS.GET_WORKING_DIRECTORY_FILES, path),
+  watchDirectoryFiles: (path: string) => ipcRenderer.invoke(IPC_CHANNELS.WATCH_DIRECTORY_FILES, path),
+  unwatchDirectoryFiles: () => ipcRenderer.invoke(IPC_CHANNELS.UNWATCH_DIRECTORY_FILES),
+  onDirectoryFilesChanged: (callback: (path: string) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, path: string) => callback(path)
+    ipcRenderer.on(IPC_CHANNELS.DIRECTORY_FILES_CHANGED, handler)
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.DIRECTORY_FILES_CHANGED, handler)
+  },
+
   // Sources
   getSources: (workspaceId: string) => ipcRenderer.invoke(IPC_CHANNELS.SOURCES_GET, workspaceId),
   createSource: (workspaceId: string, config: Partial<import('@craft-agent/shared/sources').FolderSourceConfig>) =>

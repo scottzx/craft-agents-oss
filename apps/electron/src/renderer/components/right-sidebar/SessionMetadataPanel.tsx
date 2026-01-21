@@ -3,7 +3,7 @@
  *
  * Displays two vertically stacked sections:
  * - Top: Editable session name and notes (auto-saved)
- * - Bottom: Files in the session directory
+ * - Bottom: Files in the session directory or working directory (tabbed)
  *
  * A horizontal resize handle allows adjusting the split between sections.
  */
@@ -16,7 +16,9 @@ import { Input } from '../ui/input'
 import { Textarea } from '../ui/textarea'
 import { HorizontalResizeHandle } from '../ui/horizontal-resize-handle'
 import { SessionFilesSection } from './SessionFilesSection'
+import { WorkingDirectoryFiles } from './WorkingDirectoryFiles'
 import * as storage from '@/lib/local-storage'
+import { cn } from '@/lib/utils'
 
 export interface SessionMetadataPanelProps {
   sessionId?: string
@@ -27,6 +29,9 @@ export interface SessionMetadataPanelProps {
 const DEFAULT_METADATA_HEIGHT = 250
 const MIN_METADATA_HEIGHT = 120
 const MIN_FILES_HEIGHT = 80
+
+// Tab types for files section
+type FilesTab = 'session' | 'workspace'
 
 /**
  * Custom hook for debounced callback
@@ -81,6 +86,11 @@ export function SessionMetadataPanel({ sessionId, closeButton }: SessionMetadata
   // State for resizable panel split - height of metadata section
   const [metadataHeight, setMetadataHeight] = useState(() => {
     return storage.get(storage.KEYS.sessionInfoMetadataHeight, DEFAULT_METADATA_HEIGHT)
+  })
+
+  // State for files tab
+  const [filesTab, setFilesTab] = useState<FilesTab>(() => {
+    return storage.get(storage.KEYS.filesTab, 'session') as FilesTab
   })
 
   // Get session data
@@ -157,6 +167,12 @@ export function SessionMetadataPanel({ sessionId, closeButton }: SessionMetadata
     storage.set(storage.KEYS.sessionInfoMetadataHeight, metadataHeight)
   }, [metadataHeight])
 
+  // Handle tab change
+  const handleTabChange = useCallback((tab: FilesTab) => {
+    setFilesTab(tab)
+    storage.set(storage.KEYS.filesTab, tab)
+  }, [])
+
   // Early return if no sessionId
   if (!sessionId) {
     return (
@@ -229,8 +245,43 @@ export function SessionMetadataPanel({ sessionId, closeButton }: SessionMetadata
       />
 
       {/* Files section - takes remaining space */}
-      <div className="flex-1 min-h-0 overflow-hidden">
-        <SessionFilesSection sessionId={sessionId} />
+      <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
+        {/* Tab switcher */}
+        <div className="shrink-0 flex items-center gap-1 px-2 pt-2 border-b border-border/50">
+          <button
+            onClick={() => handleTabChange('session')}
+            className={cn(
+              "px-3 py-1.5 text-xs font-medium rounded-md transition-colors",
+              "hover:bg-foreground/5",
+              filesTab === 'session'
+                ? "bg-foreground/10 text-foreground"
+                : "text-muted-foreground"
+            )}
+          >
+            Session Files
+          </button>
+          <button
+            onClick={() => handleTabChange('workspace')}
+            className={cn(
+              "px-3 py-1.5 text-xs font-medium rounded-md transition-colors",
+              "hover:bg-foreground/5",
+              filesTab === 'workspace'
+                ? "bg-foreground/10 text-foreground"
+                : "text-muted-foreground"
+            )}
+          >
+            Workspace Files
+          </button>
+        </div>
+
+        {/* Tab content */}
+        <div className="flex-1 min-h-0">
+          {filesTab === 'session' ? (
+            <SessionFilesSection sessionId={sessionId} />
+          ) : (
+            <WorkingDirectoryFiles sessionId={sessionId} />
+          )}
+        </div>
       </div>
     </div>
   )

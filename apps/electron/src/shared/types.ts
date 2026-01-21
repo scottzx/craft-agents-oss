@@ -479,6 +479,12 @@ export const IPC_CHANNELS = {
   UNWATCH_SESSION_FILES: 'sessions:unwatchFiles',  // Stop watching
   SESSION_FILES_CHANGED: 'sessions:filesChanged',  // Event: main → renderer
 
+  // Working directory files
+  GET_WORKING_DIRECTORY_FILES: 'working-directory:getFiles',
+  WATCH_DIRECTORY_FILES: 'working-directory:watchFiles',
+  UNWATCH_DIRECTORY_FILES: 'working-directory:unwatchFiles',
+  DIRECTORY_FILES_CHANGED: 'working-directory:filesChanged',  // Event: main → renderer
+
   // Theme
   GET_SYSTEM_THEME: 'theme:getSystemPreference',
   SYSTEM_THEME_CHANGED: 'theme:systemChanged',
@@ -768,6 +774,12 @@ export interface ElectronAPI {
   watchSessionFiles(sessionId: string): Promise<void>
   unwatchSessionFiles(): Promise<void>
   onSessionFilesChanged(callback: (sessionId: string) => void): () => void
+
+  // Working Directory Files
+  getWorkingDirectoryFiles(path: string): Promise<SessionFile[]>
+  watchDirectoryFiles(path: string): Promise<void>
+  unwatchDirectoryFiles(): Promise<void>
+  onDirectoryFilesChanged(callback: (path: string) => void): () => void
 
   // Sources
   getSources(workspaceId: string): Promise<LoadedSource[]>
