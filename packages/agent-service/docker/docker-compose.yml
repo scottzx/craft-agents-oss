@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  ai-api:
+    build:
+      context: ../..
+      dockerfile: packages/agent-service/docker/Dockerfile
+    container_name: craft-agent-api
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      # Anthropic API Configuration
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
+      - CUSTOM_MODEL=${CUSTOM_MODEL:-}
+
+      # JWT Secret for token validation
+      - JWT_SECRET=${JWT_SECRET}
+
+      # CloudBase Configuration (optional)
+      - CLOUDBASE_ENV_ID=${CLOUDBASE_ENV_ID:-}
+
+      # Server Configuration
+      - NODE_ENV=production
+      - PORT=3000
+      - HOST=0.0.0.0
+
+      # CORS Origins (comma-separated)
+      - CORS_ORIGINS=${CORS_ORIGINS:-}
+
+      # Rate Limiting
+      - RATE_LIMIT_WINDOW_MS=${RATE_LIMIT_WINDOW_MS:-60000}
+      - RATE_LIMIT_MAX_REQUESTS=${RATE_LIMIT_MAX_REQUESTS:-100}
+
+      # Workspace path
+      - WORKSPACE_PATH=/app/workspace
+    restart: unless-stopped
+    volumes:
+      # Mount workspace directory for persistent data
+      - workspace-data:/app/workspace
+    healthcheck:
+      test: ["CMD", "bun", "--eval", "fetch('http://localhost:3000/api/v1/health').then(r => { if (!r.ok) throw new Error('health check failed') })"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # Resource limits (adjust as needed)
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+volumes:
+  workspace-data:
+    driver: local
