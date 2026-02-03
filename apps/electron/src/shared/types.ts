@@ -11,6 +11,7 @@ import type {
   SessionMetadata as CoreSessionMetadata,
   StoredAttachment as CoreStoredAttachment,
   ContentBadge,
+  ToolDisplayMeta,
 } from '@craft-agent/core/types';
 
 // Import mode types from dedicated subpath export (avoids pulling in SDK)
@@ -32,6 +33,7 @@ export type {
   CoreSessionMetadata as SessionMetadata,
   CoreStoredAttachment as StoredAttachment,
   ContentBadge,
+  ToolDisplayMeta,
 };
 
 // Import and re-export auth types for onboarding
@@ -69,6 +71,17 @@ export interface SessionFile {
   type: 'file' | 'directory'
   size?: number
   children?: SessionFile[]  // Recursive children for directories
+}
+
+/**
+ * File search result for @ mention file selection.
+ * Returned by FS_SEARCH IPC handler when user types @filename in input.
+ */
+export interface FileSearchResult {
+  name: string
+  path: string
+  type: 'file' | 'directory'
+  relativePath: string  // Path relative to search base
 }
 
 // Import auth request types for unified auth flow
@@ -112,6 +125,30 @@ export interface McpToolsResult {
   success: boolean
   error?: string
   tools?: McpToolWithPermission[]
+}
+
+/**
+ * Search match result for session content search
+ */
+export interface SessionSearchMatch {
+  /** Session ID */
+  sessionId: string
+  /** Line number in the JSONL file */
+  lineNumber: number
+  /** The matched text snippet with context */
+  snippet: string
+}
+
+/**
+ * Aggregated search results for a session
+ */
+export interface SessionSearchResult {
+  /** Session ID */
+  sessionId: string
+  /** Number of matches found in this session */
+  matchCount: number
+  /** First few matches with context snippets */
+  matches: SessionSearchMatch[]
 }
 
 /**
@@ -199,6 +236,15 @@ export interface Plan {
 // ============================================
 
 /**
+ * Git Bash detection status (Windows only)
+ */
+export interface GitBashStatus {
+  found: boolean
+  path: string | null
+  platform: 'win32' | 'darwin' | 'linux'
+}
+
+/**
  * Result of saving onboarding configuration
  */
 export interface OnboardingSaveResult {
@@ -265,8 +311,16 @@ export interface Session {
   permissionMode?: PermissionMode
   // Todo state (user-controlled) - determines open vs closed
   todoState?: TodoState
+  // Labels (additive tags, many-per-session — bare IDs or "id::value" entries)
+  labels?: string[]
   // Read/unread tracking - ID of last message user has read
   lastReadMessageId?: string
+  /**
+   * Explicit unread flag - single source of truth for NEW badge.
+   * Set to true when assistant message completes while user is NOT viewing.
+   * Set to false when user views the session (and not processing).
+   */
+  hasUnread?: boolean
   // Per-session source selection (source slugs)
   enabledSourceSlugs?: string[]
   // Working directory for this session (used by agent for bash commands)
@@ -283,6 +337,8 @@ export interface Session {
   thinkingLevel?: ThinkingLevel
   // Role/type of the last message (for badge display without loading messages)
   lastMessageRole?: 'user' | 'assistant' | 'plan' | 'tool' | 'error'
+  // ID of the last final (non-intermediate) assistant message - pre-computed for unread detection
+  lastFinalMessageId?: string
   // Whether an async operation is ongoing (sharing, updating share, revoking, title regeneration)
   // Used for shimmer effect on session title in sidebar and panel header
   isAsyncOperationOngoing?: boolean
@@ -293,6 +349,10 @@ export interface Session {
     message: string
     statusType?: string
   }
+  // When the session was first created (ms timestamp)
+  createdAt?: number
+  // Total message count (pre-computed in JSONL header)
+  messageCount?: number
   // Token usage for context tracking
   tokenUsage?: {
     inputTokens: number
@@ -305,6 +365,8 @@ export interface Session {
     /** Model's context window size in tokens (from SDK modelUsage) */
     contextWindow?: number
   }
+  /** When true, session is hidden from session list (e.g., mini edit sessions) */
+  hidden?: boolean
 }
 
 /**
@@ -321,6 +383,12 @@ export interface CreateSessionOptions {
    * - Absolute path string: Use this specific path
    */
   workingDirectory?: string | 'user_default' | 'none'
+  /** Model override for the session (e.g., 'haiku', 'sonnet') */
+  model?: string
+  /** System prompt preset for the session ('default' | 'mini' or custom string) */
+  systemPromptPreset?: 'default' | 'mini' | string
+  /** When true, session won't appear in session list (e.g., mini edit sessions) */
+  hidden?: boolean
 }
 
 // Events sent from main to renderer
@@ -328,12 +396,11 @@ export interface CreateSessionOptions {
 export type SessionEvent =
   | { type: 'text_delta'; sessionId: string; delta: string; turnId?: string }
   | { type: 'text_complete'; sessionId: string; text: string; isIntermediate?: boolean; turnId?: string; parentToolUseId?: string }
-  | { type: 'tool_start'; sessionId: string; toolName: string; toolUseId: string; toolInput: Record<string, unknown>; toolIntent?: string; toolDisplayName?: string; turnId?: string; parentToolUseId?: string }
+  | { type: 'tool_start'; sessionId: string; toolName: string; toolUseId: string; toolInput: Record<string, unknown>; toolIntent?: string; toolDisplayName?: string; toolDisplayMeta?: import('@craft-agent/core').ToolDisplayMeta; turnId?: string; parentToolUseId?: string }
   | { type: 'tool_result'; sessionId: string; toolUseId: string; toolName: string; result: string; turnId?: string; parentToolUseId?: string; isError?: boolean }
-  | { type: 'parent_update'; sessionId: string; toolUseId: string; parentToolUseId: string }
   | { type: 'error'; sessionId: string; error: string }
   | { type: 'typed_error'; sessionId: string; error: TypedError }
-  | { type: 'complete'; sessionId: string; tokenUsage?: Session['tokenUsage'] }
+  | { type: 'complete'; sessionId: string; tokenUsage?: Session['tokenUsage']; hasUnread?: boolean }
   | { type: 'interrupted'; sessionId: string; message?: Message }
   | { type: 'status'; sessionId: string; message: string; statusType?: 'compacting' }
   | { type: 'info'; sessionId: string; message: string; statusType?: 'compaction_complete'; level?: 'info' | 'warning' | 'error' | 'success' }
@@ -349,6 +416,7 @@ export type SessionEvent =
   | { type: 'plan_submitted'; sessionId: string; message: CoreMessage }
   // Source events
   | { type: 'sources_changed'; sessionId: string; enabledSourceSlugs: string[] }
+  | { type: 'labels_changed'; sessionId: string; labels: string[] }
   // Background task/shell events
   | { type: 'task_backgrounded'; sessionId: string; toolUseId: string; taskId: string; intent?: string; turnId?: string }
   | { type: 'shell_backgrounded'; sessionId: string; toolUseId: string; shellId: string; intent?: string; command?: string; turnId?: string }
@@ -397,10 +465,13 @@ export type SessionCommand =
   | { type: 'setTodoState'; state: TodoState }
   | { type: 'markRead' }
   | { type: 'markUnread' }
+  /** Track which session user is actively viewing (for unread state machine) */
+  | { type: 'setActiveViewing'; workspaceId: string }
   | { type: 'setPermissionMode'; mode: PermissionMode }
   | { type: 'setThinkingLevel'; level: ThinkingLevel }
   | { type: 'updateWorkingDirectory'; dir: string }
   | { type: 'setSources'; sourceSlugs: string[] }
+  | { type: 'setLabels'; labels: string[] }
   | { type: 'showInFinder' }
   | { type: 'copyPath' }
   | { type: 'shareToViewer' }
@@ -466,10 +537,17 @@ export const IPC_CHANNELS = {
 
   // File operations
   READ_FILE: 'file:read',
+  READ_FILE_DATA_URL: 'file:readDataUrl',
+  READ_FILE_BINARY: 'file:readBinary',
   OPEN_FILE_DIALOG: 'file:openDialog',
   READ_FILE_ATTACHMENT: 'file:readAttachment',
   STORE_ATTACHMENT: 'file:storeAttachment',
   GENERATE_THUMBNAIL: 'file:generateThumbnail',
+
+  // Filesystem search (for @ mention file selection)
+  FS_SEARCH: 'fs:search',
+  // Debug logging from renderer → main log file
+  DEBUG_LOG: 'debug:log',
 
   // Session info panel
   GET_SESSION_FILES: 'sessions:getFiles',
@@ -493,9 +571,6 @@ export const IPC_CHANNELS = {
   GET_VERSIONS: 'system:versions',
   GET_HOME_DIR: 'system:homeDir',
   IS_DEBUG_MODE: 'system:isDebugMode',
-
-  // Git
-  GET_GIT_BRANCH: 'git:branch',
 
   // Auto-update
   UPDATE_CHECK: 'update:check',
@@ -529,19 +604,16 @@ export const IPC_CHANNELS = {
   ONBOARDING_VALIDATE_MCP: 'onboarding:validateMcp',
   ONBOARDING_START_MCP_OAUTH: 'onboarding:startMcpOAuth',
   ONBOARDING_SAVE_CONFIG: 'onboarding:saveConfig',
-  // Claude OAuth
-  ONBOARDING_GET_EXISTING_CLAUDE_TOKEN: 'onboarding:getExistingClaudeToken',
-  ONBOARDING_IS_CLAUDE_CLI_INSTALLED: 'onboarding:isClaudeCliInstalled',
-  ONBOARDING_RUN_CLAUDE_SETUP_TOKEN: 'onboarding:runClaudeSetupToken',
-  // Native Claude OAuth (two-step flow)
+  // Claude OAuth (two-step flow)
   ONBOARDING_START_CLAUDE_OAUTH: 'onboarding:startClaudeOAuth',
   ONBOARDING_EXCHANGE_CLAUDE_CODE: 'onboarding:exchangeClaudeCode',
   ONBOARDING_HAS_CLAUDE_OAUTH_STATE: 'onboarding:hasClaudeOAuthState',
   ONBOARDING_CLEAR_CLAUDE_OAUTH_STATE: 'onboarding:clearClaudeOAuthState',
 
-  // Settings - Billing
-  SETTINGS_GET_BILLING_METHOD: 'settings:getBillingMethod',
-  SETTINGS_UPDATE_BILLING_METHOD: 'settings:updateBillingMethod',
+  // Settings - API Setup
+  SETTINGS_GET_API_SETUP: 'settings:getApiSetup',
+  SETTINGS_UPDATE_API_SETUP: 'settings:updateApiSetup',
+  SETTINGS_TEST_API_CONNECTION: 'settings:testApiConnection',
 
   // Settings - Model
   SETTINGS_GET_MODEL: 'settings:getModel',
@@ -581,6 +653,9 @@ export const IPC_CHANNELS = {
   // MCP tools listing
   SOURCES_GET_MCP_TOOLS: 'sources:getMcpTools',
 
+  // Session content search (full-text via ripgrep)
+  SEARCH_SESSIONS: 'sessions:searchContent',
+
   // Skills (workspace-scoped)
   SKILLS_GET: 'skills:get',
   SKILLS_GET_FILES: 'skills:getFiles',
@@ -591,7 +666,18 @@ export const IPC_CHANNELS = {
 
   // Status management (workspace-scoped)
   STATUSES_LIST: 'statuses:list',
+  STATUSES_REORDER: 'statuses:reorder',  // Reorder statuses (drag-and-drop)
   STATUSES_CHANGED: 'statuses:changed',  // Broadcast event
+
+  // Label management (workspace-scoped)
+  LABELS_LIST: 'labels:list',
+  LABELS_CREATE: 'labels:create',
+  LABELS_DELETE: 'labels:delete',
+  LABELS_CHANGED: 'labels:changed',  // Broadcast event
+
+  // Views management (workspace-scoped, stored in views.json)
+  VIEWS_LIST: 'views:list',
+  VIEWS_SAVE: 'views:save',
 
   // Theme management (cascading: app → workspace)
   THEME_APP_CHANGED: 'theme:appChanged',        // Broadcast event
@@ -613,6 +699,9 @@ export const IPC_CHANNELS = {
   THEME_BROADCAST_PREFERENCES: 'theme:broadcastPreferences',  // Send preferences to main for broadcast
   THEME_PREFERENCES_CHANGED: 'theme:preferencesChanged',  // Broadcast: preferences changed in another window
 
+  // Tool icon mappings (for Appearance settings)
+  TOOL_ICONS_GET_MAPPINGS: 'toolIcons:getMappings',
+
   // Logo URL resolution (uses Node.js filesystem cache)
   LOGO_GET_URL: 'logo:getUrl',
 
@@ -622,16 +711,56 @@ export const IPC_CHANNELS = {
   NOTIFICATION_GET_ENABLED: 'notification:getEnabled',
   NOTIFICATION_SET_ENABLED: 'notification:setEnabled',
 
+  // Input settings
+  INPUT_GET_AUTO_CAPITALISATION: 'input:getAutoCapitalisation',
+  INPUT_SET_AUTO_CAPITALISATION: 'input:setAutoCapitalisation',
+  INPUT_GET_SEND_MESSAGE_KEY: 'input:getSendMessageKey',
+  INPUT_SET_SEND_MESSAGE_KEY: 'input:setSendMessageKey',
+  INPUT_GET_SPELL_CHECK: 'input:getSpellCheck',
+  INPUT_SET_SPELL_CHECK: 'input:setSpellCheck',
+
   BADGE_UPDATE: 'badge:update',
   BADGE_CLEAR: 'badge:clear',
   BADGE_SET_ICON: 'badge:setIcon',
   BADGE_DRAW: 'badge:draw',  // Broadcast: { count: number, iconDataUrl: string }
   WINDOW_FOCUS_STATE: 'window:focusState',  // Broadcast: boolean (isFocused)
   WINDOW_GET_FOCUS_STATE: 'window:getFocusState',
+
+  // Git operations
+  GET_GIT_BRANCH: 'git:getBranch',
+
+  // Git Bash (Windows)
+  GITBASH_CHECK: 'gitbash:check',
+  GITBASH_BROWSE: 'gitbash:browse',
+  GITBASH_SET_PATH: 'gitbash:setPath',
+
+  // Menu actions (renderer → main for window/app control)
+  MENU_QUIT: 'menu:quit',
+  MENU_MINIMIZE: 'menu:minimize',
+  MENU_MAXIMIZE: 'menu:maximize',
+  MENU_ZOOM_IN: 'menu:zoomIn',
+  MENU_ZOOM_OUT: 'menu:zoomOut',
+  MENU_ZOOM_RESET: 'menu:zoomReset',
+  MENU_TOGGLE_DEVTOOLS: 'menu:toggleDevTools',
+  MENU_UNDO: 'menu:undo',
+  MENU_REDO: 'menu:redo',
+  MENU_CUT: 'menu:cut',
+  MENU_COPY: 'menu:copy',
+  MENU_PASTE: 'menu:paste',
+  MENU_SELECT_ALL: 'menu:selectAll',
 } as const
 
 // Re-import types for ElectronAPI
 import type { Workspace, SessionMetadata, StoredAttachment as StoredAttachmentType } from '@craft-agent/core/types';
+
+/** Tool icon mapping entry from tool-icons.json (with icon resolved to data URL) */
+export interface ToolIconMapping {
+  id: string
+  displayName: string
+  /** Data URL of the icon (e.g., data:image/png;base64,...) */
+  iconDataUrl: string
+  commands: string[]
+}
 
 // Type-safe IPC API exposed to renderer
 export interface ElectronAPI {
@@ -676,10 +805,17 @@ export interface ElectronAPI {
 
   // File operations
   readFile(path: string): Promise<string>
+  /** Read a file as a data URL (data:{mime};base64,...) for binary preview (images, PDFs) */
+  readFileDataUrl(path: string): Promise<string>
   openFileDialog(): Promise<string[]>
   readFileAttachment(path: string): Promise<FileAttachment | null>
   storeAttachment(sessionId: string, attachment: FileAttachment): Promise<import('../../../../packages/core/src/types/index.ts').StoredAttachment>
   generateThumbnail(base64: string, mimeType: string): Promise<string | null>
+
+  // Filesystem search (for @ mention file selection)
+  searchFiles(basePath: string, query: string): Promise<FileSearchResult[]>
+  // Debug: send renderer logs to main process log file
+  debugLog(...args: unknown[]): void
 
   // Theme
   getSystemTheme(): Promise<boolean>
@@ -689,9 +825,6 @@ export interface ElectronAPI {
   getVersions(): { node: string; chrome: string; electron: string }
   getHomeDir(): Promise<string>
   isDebugMode(): Promise<boolean>
-
-  // Git
-  getGitBranch(path: string): Promise<string | null>
 
   // Auto-update
   checkForUpdates(): Promise<UpdateInfo>
@@ -728,20 +861,20 @@ export interface ElectronAPI {
     authType?: AuthType  // Optional - if not provided, preserves existing auth type (for add workspace)
     workspace?: { name: string; iconUrl?: string; mcpUrl?: string }  // Optional - if not provided, only updates billing
     credential?: string  // API key or OAuth token based on authType
+    mcpCredentials?: { accessToken: string; clientId?: string }  // MCP OAuth credentials
+    anthropicBaseUrl?: string | null  // Custom Anthropic API base URL
+    customModel?: string | null  // Custom model ID override
   }): Promise<OnboardingSaveResult>
-  // Claude OAuth
-  getExistingClaudeToken(): Promise<string | null>
-  isClaudeCliInstalled(): Promise<boolean>
-  runClaudeSetupToken(): Promise<ClaudeOAuthResult>
-  // Native Claude OAuth (two-step flow)
+  // Claude OAuth (two-step flow)
   startClaudeOAuth(): Promise<{ success: boolean; authUrl?: string; error?: string }>
   exchangeClaudeCode(code: string): Promise<ClaudeOAuthResult>
   hasClaudeOAuthState(): Promise<boolean>
   clearClaudeOAuthState(): Promise<{ success: boolean }>
 
-  // Settings - Billing
-  getBillingMethod(): Promise<BillingMethodInfo>
-  updateBillingMethod(authType: AuthType, credential?: string): Promise<void>
+  // Settings - API Setup
+  getApiSetup(): Promise<ApiSetupInfo>
+  updateApiSetup(authType: AuthType, credential?: string, anthropicBaseUrl?: string | null, customModel?: string | null): Promise<void>
+  testApiConnection(apiKey: string, baseUrl?: string, modelName?: string): Promise<{ success: boolean; error?: string; modelCount?: number }>
 
   // Settings - Model (global default)
   getModel(): Promise<string | null>
@@ -792,6 +925,9 @@ export interface ElectronAPI {
   getDefaultPermissionsConfig(): Promise<{ config: import('@craft-agent/shared/agent').PermissionsConfigFile | null; path: string }>
   getMcpTools(workspaceId: string, sourceSlug: string): Promise<McpToolsResult>
 
+  // Session content search (full-text search via ripgrep)
+  searchSessionContent(workspaceId: string, query: string, searchId?: string): Promise<SessionSearchResult[]>
+
   // Sources change listener (live updates when sources are added/removed)
   onSourcesChanged(callback: (sources: LoadedSource[]) => void): () => void
 
@@ -810,12 +946,27 @@ export interface ElectronAPI {
 
   // Statuses (workspace-scoped)
   listStatuses(workspaceId: string): Promise<import('@craft-agent/shared/statuses').StatusConfig[]>
+  reorderStatuses(workspaceId: string, orderedIds: string[]): Promise<void>
   // Statuses change listener (live updates when statuses config or icon files change)
   onStatusesChanged(callback: (workspaceId: string) => void): () => void
+
+  // Labels (workspace-scoped)
+  listLabels(workspaceId: string): Promise<import('@craft-agent/shared/labels').LabelConfig[]>
+  createLabel(workspaceId: string, input: import('@craft-agent/shared/labels').CreateLabelInput): Promise<import('@craft-agent/shared/labels').LabelConfig>
+  deleteLabel(workspaceId: string, labelId: string): Promise<{ stripped: number }>
+  // Labels change listener (live updates when labels config changes)
+  onLabelsChanged(callback: (workspaceId: string) => void): () => void
+
+  // Views (workspace-scoped, stored in views.json)
+  listViews(workspaceId: string): Promise<import('@craft-agent/shared/views').ViewConfig[]>
+  saveViews(workspaceId: string, views: import('@craft-agent/shared/views').ViewConfig[]): Promise<void>
 
   // Generic workspace image loading/saving (returns data URL for images, raw string for SVG)
   readWorkspaceImage(workspaceId: string, relativePath: string): Promise<string>
   writeWorkspaceImage(workspaceId: string, relativePath: string, base64: string, mimeType: string): Promise<void>
+
+  // Tool icon mappings (for Appearance settings page)
+  getToolIconMappings(): Promise<ToolIconMapping[]>
 
   // Theme (app-level only)
   getAppTheme(): Promise<import('@config/theme').ThemeOverrides | null>
@@ -836,6 +987,14 @@ export interface ElectronAPI {
   getNotificationsEnabled(): Promise<boolean>
   setNotificationsEnabled(enabled: boolean): Promise<void>
 
+  // Input settings
+  getAutoCapitalisation(): Promise<boolean>
+  setAutoCapitalisation(enabled: boolean): Promise<void>
+  getSendMessageKey(): Promise<'enter' | 'cmd-enter'>
+  setSendMessageKey(key: 'enter' | 'cmd-enter'): Promise<void>
+  getSpellCheck(): Promise<boolean>
+  setSpellCheck(enabled: boolean): Promise<void>
+
   updateBadgeCount(count: number): Promise<void>
   clearBadgeCount(): Promise<void>
   setDockIconWithBadge(dataUrl: string): Promise<void>
@@ -847,6 +1006,30 @@ export interface ElectronAPI {
   // Theme preferences sync across windows (mode, colorTheme, font)
   broadcastThemePreferences(preferences: { mode: string; colorTheme: string; font: string }): Promise<void>
   onThemePreferencesChange(callback: (preferences: { mode: string; colorTheme: string; font: string }) => void): () => void
+
+  // Git operations
+  getGitBranch(dirPath: string): Promise<string | null>
+
+  // Git Bash (Windows)
+  checkGitBash(): Promise<GitBashStatus>
+  browseForGitBash(): Promise<string | null>
+  setGitBashPath(path: string): Promise<{ success: boolean; error?: string }>
+
+  // Menu actions (from renderer to main)
+  menuQuit(): Promise<void>
+  menuNewWindow(): Promise<void>
+  menuMinimize(): Promise<void>
+  menuMaximize(): Promise<void>
+  menuZoomIn(): Promise<void>
+  menuZoomOut(): Promise<void>
+  menuZoomReset(): Promise<void>
+  menuToggleDevTools(): Promise<void>
+  menuUndo(): Promise<void>
+  menuRedo(): Promise<void>
+  menuCut(): Promise<void>
+  menuCopy(): Promise<void>
+  menuPaste(): Promise<void>
+  menuSelectAll(): Promise<void>
 }
 
 /**
@@ -859,11 +1042,14 @@ export interface ClaudeOAuthResult {
 }
 
 /**
- * Current billing method info for settings
+ * Current API setup info for settings
  */
-export interface BillingMethodInfo {
+export interface ApiSetupInfo {
   authType: AuthType
   hasCredential: boolean
+  apiKey?: string  // The stored API key (only returned for api_key auth type)
+  anthropicBaseUrl?: string  // Custom Anthropic API base URL (for third-party compatible APIs)
+  customModel?: string  // Custom model ID override (for third-party APIs)
 }
 
 /**
@@ -876,8 +1062,6 @@ export interface UpdateInfo {
   currentVersion: string
   /** Latest available version (null if check failed) */
   latestVersion: string | null
-  /** Download URL for the update DMG */
-  downloadUrl: string | null
   /** Download state */
   downloadState: 'idle' | 'downloading' | 'ready' | 'installing' | 'error'
   /** Download progress (0-100) */
@@ -934,25 +1118,19 @@ export type RightSidebarPanel =
  * - 'allChats': All sessions regardless of status
  * - 'flagged': Only flagged sessions
  * - 'state': Sessions with specific status ID
+ * - 'label': Sessions with specific label (includes descendants via tree hierarchy)
  */
 export type ChatFilter =
   | { kind: 'allChats' }
   | { kind: 'flagged' }
   | { kind: 'state'; stateId: string }
-
-/**
- * Source filter options - determines which sources to show
- * - 'all': All sources regardless of type
- * - 'type': Sources of specific type (api, mcp, local)
- */
-export type SourceFilter =
-  | { kind: 'all' }
-  | { kind: 'type'; sourceType: 'api' | 'mcp' | 'local' }
+  | { kind: 'label'; labelId: string }
+  | { kind: 'view'; viewId: string }
 
 /**
  * Settings subpage options
  */
-export type SettingsSubpage = 'app' | 'workspace' | 'permissions' | 'shortcuts' | 'preferences'
+export type SettingsSubpage = 'app' | 'appearance' | 'input' | 'workspace' | 'permissions' | 'labels' | 'shortcuts' | 'preferences'
 
 /**
  * Chats navigation state - shows SessionList in navigator
@@ -967,11 +1145,19 @@ export interface ChatsNavigationState {
 }
 
 /**
+ * Source type filter for sources navigation (e.g., show only APIs, MCPs, or Local sources)
+ */
+export interface SourceFilter {
+  kind: 'type'
+  sourceType: 'api' | 'mcp' | 'local'
+}
+
+/**
  * Sources navigation state - shows SourcesListPanel in navigator
  */
 export interface SourcesNavigationState {
   navigator: 'sources'
-  /** Filter to show all sources or by type (api, mcp, local). Defaults to 'all' if not specified. */
+  /** Optional filter for source type */
   filter?: SourceFilter
   /** Selected source details, or null for empty state */
   details: { type: 'source'; sourceSlug: string } | null
@@ -995,7 +1181,7 @@ export interface SettingsNavigationState {
  */
 export interface SkillsNavigationState {
   navigator: 'skills'
-  /** Selected skill details, or null for empty state */
+  /** Selected skill details or null for empty state */
   details: { type: 'skill'; skillSlug: string } | null
   /** Optional right sidebar panel state */
   rightSidebar?: RightSidebarPanel
@@ -1057,18 +1243,13 @@ export const DEFAULT_NAVIGATION_STATE: NavigationState = {
  */
 export const getNavigationStateKey = (state: NavigationState): string => {
   if (state.navigator === 'sources') {
-    // Build base key from filter (sources, sources/api, sources/mcp, sources/local)
-    let base = 'sources'
-    if (state.filter?.kind === 'type') {
-      base = `sources/${state.filter.sourceType}`
-    }
     if (state.details) {
-      return `${base}/source/${state.details.sourceSlug}`
+      return `sources/source/${state.details.sourceSlug}`
     }
-    return base
+    return 'sources'
   }
   if (state.navigator === 'skills') {
-    if (state.details) {
+    if (state.details?.type === 'skill') {
       return `skills/skill/${state.details.skillSlug}`
     }
     return 'skills'
@@ -1080,6 +1261,8 @@ export const getNavigationStateKey = (state: NavigationState): string => {
   const f = state.filter
   let base: string
   if (f.kind === 'state') base = `state:${f.stateId}`
+  else if (f.kind === 'label') base = `label:${f.labelId}`
+  else if (f.kind === 'view') base = `view:${f.viewId}`
   else base = f.kind
   if (state.details) {
     return `${base}/chat/${state.details.sessionId}`
@@ -1092,22 +1275,8 @@ export const getNavigationStateKey = (state: NavigationState): string => {
  * Returns null if the key is invalid
  */
 export const parseNavigationStateKey = (key: string): NavigationState | null => {
-  // Handle sources with optional type filter (sources, sources/api, sources/mcp, sources/local)
+  // Handle sources
   if (key === 'sources') return { navigator: 'sources', details: null }
-
-  // Check for type-filtered sources (e.g., sources/api, sources/mcp, sources/local)
-  const sourceTypeMatch = key.match(/^sources\/(api|mcp|local)(?:\/source\/(.+))?$/)
-  if (sourceTypeMatch) {
-    const sourceType = sourceTypeMatch[1] as 'api' | 'mcp' | 'local'
-    const sourceSlug = sourceTypeMatch[2]
-    return {
-      navigator: 'sources',
-      filter: { kind: 'type', sourceType },
-      details: sourceSlug ? { type: 'source', sourceSlug } : null,
-    }
-  }
-
-  // Unfiltered source selection (e.g., sources/source/my-source)
   if (key.startsWith('sources/source/')) {
     const sourceSlug = key.slice(15)
     if (sourceSlug) {
@@ -1130,7 +1299,7 @@ export const parseNavigationStateKey = (key: string): NavigationState | null => 
   if (key === 'settings') return { navigator: 'settings', subpage: 'app' }
   if (key.startsWith('settings:')) {
     const subpage = key.slice(9) as SettingsSubpage
-    if (['app', 'workspace', 'shortcuts', 'preferences'].includes(subpage)) {
+    if (['app', 'appearance', 'input', 'workspace', 'permissions', 'labels', 'shortcuts', 'preferences'].includes(subpage)) {
       return { navigator: 'settings', subpage }
     }
   }
@@ -1144,6 +1313,14 @@ export const parseNavigationStateKey = (key: string): NavigationState | null => 
       const stateId = filterKey.slice(6)
       if (!stateId) return null
       filter = { kind: 'state', stateId }
+    } else if (filterKey.startsWith('label:')) {
+      const labelId = filterKey.slice(6)
+      if (!labelId) return null
+      filter = { kind: 'label', labelId }
+    } else if (filterKey.startsWith('view:')) {
+      const viewId = filterKey.slice(5)
+      if (!viewId) return null
+      filter = { kind: 'view', viewId }
     } else {
       return null
     }

@@ -1,5 +1,7 @@
 import * as React from 'react'
 import { useMemo, useEffect, useRef, useCallback, useState } from 'react'
+import type { ToolDisplayMeta } from '@craft-agent/core'
+import { normalizePath, pathStartsWith, stripPathPrefix } from '@craft-agent/core/utils'
 import { motion, AnimatePresence } from 'motion/react'
 import {
   ChevronRight,
@@ -23,6 +25,9 @@ import * as ReactDOM from 'react-dom'
 import { cn } from '../../lib/utils'
 import { Markdown } from '../markdown'
 import { Spinner } from '../ui/LoadingIndicator'
+import { Tooltip, TooltipTrigger, TooltipContent } from '../tooltip'
+import { parseDiffFromFile, type FileContents } from '@pierre/diffs'
+import { getDiffStats } from '../code-viewer'
 import { TurnCardActionsMenu } from './TurnCardActionsMenu'
 import { computeLastChildSet, groupActivitiesByParent, isActivityGroup, formatDuration, formatTokens, deriveTurnPhase, shouldShowThinkingIndicator, type ActivityGroup, type AssistantTurn } from './turn-utils'
 import { DocumentFormattedMarkdownOverlay } from '../overlay'
@@ -34,13 +39,15 @@ import { AcceptPlanDropdown } from './AcceptPlanDropdown'
 
 /**
  * Simple markdown stripping for preview text.
- * Removes common markdown syntax to show plain text preview.
+ * Removes markdown syntax to show plain text preview.
+ * Code block content is preserved as plain text.
  */
 function stripMarkdown(text: string): string {
   return text
-    // Remove code blocks
-    .replace(/```[\s\S]*?```/g, '')
-    .replace(/`[^`]*`/g, '')
+    // Extract content from fenced code blocks (remove ``` and optional language)
+    .replace(/```(?:\w+)?\n?([\s\S]*?)```/g, '$1')
+    // Extract content from inline code
+    .replace(/`([^`]+)`/g, '$1')
     // Remove headers
     .replace(/^#{1,6}\s+/gm, '')
     // Remove bold/italic
@@ -61,6 +68,45 @@ function stripMarkdown(text: string): string {
     .trim()
 }
 
+/**
+ * Compute diff stats for Edit/Write tool inputs.
+ * Uses @pierre/diffs for accurate line-by-line diff calculation.
+ *
+ * @param toolName - 'Edit' or 'Write'
+ * @param toolInput - The tool input containing old_string/new_string (Edit) or content (Write)
+ * @returns { additions, deletions } or null if not applicable
+ */
+function computeEditWriteDiffStats(
+  toolName: string | undefined,
+  toolInput: Record<string, unknown> | undefined
+): { additions: number; deletions: number } | null {
+  if (!toolInput) return null
+
+  if (toolName === 'Edit') {
+    const oldString = (toolInput.old_string as string) ?? ''
+    const newString = (toolInput.new_string as string) ?? ''
+    if (!oldString && !newString) return null
+
+    const oldFile: FileContents = { name: 'file', contents: oldString, lang: 'text' }
+    const newFile: FileContents = { name: 'file', contents: newString, lang: 'text' }
+    const fileDiff = parseDiffFromFile(oldFile, newFile)
+    return getDiffStats(fileDiff)
+  }
+
+  if (toolName === 'Write') {
+    const content = (toolInput.content as string) ?? ''
+    if (!content) return null
+
+    // For Write, everything is an addition (new file content)
+    const oldFile: FileContents = { name: 'file', contents: '', lang: 'text' }
+    const newFile: FileContents = { name: 'file', contents: content, lang: 'text' }
+    const fileDiff = parseDiffFromFile(oldFile, newFile)
+    return getDiffStats(fileDiff)
+  }
+
+  return null
+}
+
 // ============================================================================
 // Size Configuration
 // ============================================================================
@@ -69,7 +115,8 @@ function stripMarkdown(text: string): string {
  * Global size configuration for TurnCard components.
  * Adjust these values to scale the entire component uniformly.
  */
-const SIZE_CONFIG = {
+/** Shared size configuration for activity UI - exported for reuse in inline execution */
+export const SIZE_CONFIG = {
   /** Base font size class for all text */
   fontSize: 'text-[13px]',
   /** Icon size class (width and height) */
@@ -118,6 +165,7 @@ export interface ActivityItem {
   content?: string
   intent?: string
   displayName?: string  // LLM-generated human-friendly tool name (for MCP tools)
+  toolDisplayMeta?: ToolDisplayMeta  // Embedded metadata with base64 icon (for viewer compatibility)
   timestamp: number
   error?: string
   // Parent-child nesting for Task subagents
@@ -139,6 +187,10 @@ export interface ResponseContent {
   /** Whether this response is a plan (renders with plan variant) */
   isPlan?: boolean
 }
+
+// ============================================================================
+// TurnCard Props
+// ============================================================================
 
 export interface TurnCardProps {
   /** Session ID for state persistence (optional in shared context) */
@@ -191,6 +243,12 @@ export interface TurnCardProps {
   isLastResponse?: boolean
   /** Session folder path for stripping from file paths in tool display */
   sessionFolderPath?: string
+  /** Display mode: 'detailed' shows all info, 'informative' hides MCP/API names and params */
+  displayMode?: 'informative' | 'detailed'
+  /** Animate response appearance (for playground demos) */
+  animateResponse?: boolean
+  /** Hide footers for compact embedding (EditPopover) */
+  compactMode?: boolean
 }
 
 // ============================================================================
@@ -369,16 +427,16 @@ function stripSessionFolderPath(filePath: string, sessionFolderPath?: string): s
 
   // Get workspace path (parent of sessions folder)
   // sessionFolderPath: /path/workspaces/{uuid}/sessions/{sessionId}
-  const workspacePath = sessionFolderPath.replace(/\/sessions\/[^/]+$/, '')
+  const workspacePath = normalizePath(sessionFolderPath).replace(/\/sessions\/[^/]+$/, '')
 
   // Try session folder first (more specific)
-  if (filePath.startsWith(sessionFolderPath + '/')) {
-    return filePath.slice(sessionFolderPath.length + 1)
+  if (pathStartsWith(filePath, sessionFolderPath)) {
+    return stripPathPrefix(filePath, sessionFolderPath)
   }
 
   // Then try workspace folder
-  if (filePath.startsWith(workspacePath + '/')) {
-    return filePath.slice(workspacePath.length + 1)
+  if (pathStartsWith(filePath, workspacePath)) {
+    return stripPathPrefix(filePath, workspacePath)
   }
 
   return filePath
@@ -416,6 +474,54 @@ function formatToolInput(
     if (parts.length >= 2) break // Max 2 values
   }
   return parts.join(' ')
+}
+
+/**
+ * Format tool display using embedded toolDisplayMeta.
+ * toolDisplayMeta is set at storage time in the main process and includes:
+ * - displayName: Human-readable name
+ * - iconDataUrl: Base64-encoded icon (for skills/sources)
+ * - description: Brief description
+ * - category: 'skill' | 'source' | 'native' | 'mcp'
+ */
+function formatToolDisplay(
+  activity: ActivityItem
+): { name: string; icon?: string; description?: string } {
+  const { toolName, displayName, toolInput, toolDisplayMeta } = activity
+
+  // Primary: Use embedded toolDisplayMeta (works in both Electron and viewer)
+  if (toolDisplayMeta) {
+    // For MCP tools, append the tool slug to the source name
+    if (toolName?.startsWith('mcp__') && toolDisplayMeta.category === 'source') {
+      const parts = toolName.match(/^mcp__([^_]+)__(.+)$/)
+      if (parts) {
+        const toolSlug = parts[2]
+        return {
+          name: `${toolDisplayMeta.displayName}: ${toolSlug}`,
+          icon: toolDisplayMeta.iconDataUrl,
+          description: toolDisplayMeta.description,
+        }
+      }
+    }
+    return {
+      name: toolDisplayMeta.displayName,
+      icon: toolDisplayMeta.iconDataUrl,
+      description: toolDisplayMeta.description,
+    }
+  }
+
+  // Fallback for Skill tool without toolDisplayMeta (legacy sessions)
+  if (toolName === 'Skill' && toolInput?.skill) {
+    const skillId = String(toolInput.skill)
+    // Extract slug from qualified name (workspaceId:slug) for display
+    const colonIdx = skillId.indexOf(':')
+    const slug = colonIdx > 0 ? skillId.slice(colonIdx + 1) : skillId
+    return { name: slug }
+  }
+
+  // Final fallback: Use LLM-generated displayName or tool name
+  const name = displayName || (toolName ? getToolDisplayName(toolName) : 'Processing')
+  return { name }
 }
 
 /** Get the primary preview text for collapsed state */
@@ -490,35 +596,90 @@ function getPreviewText(
 // Sub-Components
 // ============================================================================
 
-/** Status icon for an activity - Edit/Write tools show tool-specific icons when completed */
-function ActivityStatusIcon({ status, toolName }: { status: ActivityStatus; toolName?: string }) {
-  switch (status) {
-    case 'pending':
-      return <Circle className={cn(SIZE_CONFIG.iconSize, "shrink-0 text-muted-foreground/50")} />
-    case 'running':
-      return (
-        <div className={cn(SIZE_CONFIG.iconSize, "flex items-center justify-center shrink-0")}>
-          <Spinner className={SIZE_CONFIG.spinnerSize} />
-        </div>
-      )
-    case 'backgrounded':
-      return (
-        <div className={cn(SIZE_CONFIG.iconSize, "flex items-center justify-center shrink-0")}>
-          <Spinner className={cn(SIZE_CONFIG.spinnerSize, "text-accent")} />
-        </div>
-      )
-    case 'completed':
-      // Edit and Write tools get their own icons with accent color instead of green checkmark
-      if (toolName === 'Edit') {
-        return <Pencil className={cn(SIZE_CONFIG.iconSize, "shrink-0 text-accent")} />
+/**
+ * Status icon for an activity - exported for reuse in inline execution.
+ * Supports custom icons from skill/source metadata when completed.
+ * Edit/Write tools show tool-specific icons; others show checkmark or custom icon.
+ */
+export function ActivityStatusIcon({
+  status,
+  toolName,
+  customIcon
+}: {
+  status: ActivityStatus
+  toolName?: string
+  /** Custom icon from tool metadata - emoji or data URL (base64) */
+  customIcon?: string
+}) {
+  // Render the appropriate icon based on status
+  const renderIcon = () => {
+    // For completed status with custom icon, use it instead of checkmark
+    if (status === 'completed' && customIcon) {
+      // Check if it's an emoji (short string, not a URL or data URL)
+      // Emojis can be 1-4+ characters due to ZWJ sequences
+      const isLikelyEmoji = customIcon.length <= 8 && !/^(https?:\/\/|data:)/.test(customIcon)
+      if (isLikelyEmoji) {
+        return (
+          <span className={cn(SIZE_CONFIG.iconSize, "shrink-0 flex items-center justify-center text-[10px] leading-none")}>
+            {customIcon}
+          </span>
+        )
       }
-      if (toolName === 'Write') {
-        return <FilePenLine className={cn(SIZE_CONFIG.iconSize, "shrink-0 text-accent")} />
-      }
-      return <CheckCircle2 className={cn(SIZE_CONFIG.iconSize, "shrink-0 text-success")} />
-    case 'error':
-      return <XCircle className={cn(SIZE_CONFIG.iconSize, "shrink-0 text-destructive")} />
+      // Otherwise it's a data URL (base64) or HTTP URL
+      return (
+        <img
+          src={customIcon}
+          alt=""
+          className={cn(SIZE_CONFIG.iconSize, "shrink-0 rounded-sm object-contain")}
+        />
+      )
+    }
+
+    // Default icon logic
+    switch (status) {
+      case 'pending':
+        return <Circle className={cn(SIZE_CONFIG.iconSize, "shrink-0 text-muted-foreground/50")} />
+      case 'running':
+        return (
+          <div className={cn(SIZE_CONFIG.iconSize, "flex items-center justify-center shrink-0")}>
+            <Spinner className={SIZE_CONFIG.spinnerSize} />
+          </div>
+        )
+      case 'backgrounded':
+        return (
+          <div className={cn(SIZE_CONFIG.iconSize, "flex items-center justify-center shrink-0")}>
+            <Spinner className={cn(SIZE_CONFIG.spinnerSize, "text-accent")} />
+          </div>
+        )
+      case 'completed':
+        // Edit and Write tools get their own icons with accent color instead of green checkmark
+        if (toolName === 'Edit') {
+          return <Pencil className={cn(SIZE_CONFIG.iconSize, "shrink-0 text-accent")} />
+        }
+        if (toolName === 'Write') {
+          return <FilePenLine className={cn(SIZE_CONFIG.iconSize, "shrink-0 text-accent")} />
+        }
+        return <CheckCircle2 className={cn(SIZE_CONFIG.iconSize, "shrink-0 text-success")} />
+      case 'error':
+        return <XCircle className={cn(SIZE_CONFIG.iconSize, "shrink-0 text-destructive")} />
+    }
   }
+
+  // Wrap in AnimatePresence for crossfade between states
+  return (
+    <AnimatePresence mode="wait" initial={false}>
+      <motion.div
+        key={status}
+        initial={{ opacity: 0, scale: 0.8 }}
+        animate={{ opacity: 1, scale: 1 }}
+        exit={{ opacity: 0, scale: 0.8 }}
+        transition={{ duration: 0.2, ease: "easeOut" }}
+        className="shrink-0"
+      >
+        {renderIcon()}
+      </motion.div>
+    </AnimatePresence>
+  )
 }
 
 interface ActivityRowProps {
@@ -529,6 +690,8 @@ interface ActivityRowProps {
   isLastChild?: boolean
   /** Session folder path for stripping from file paths in tool display */
   sessionFolderPath?: string
+  /** Display mode: 'detailed' shows all info, 'informative' hides MCP/API names and params */
+  displayMode?: 'informative' | 'detailed'
 }
 
 /**
@@ -550,7 +713,7 @@ function TreeViewConnector({ depth }: { depth: number; isLastChild?: boolean }) 
 }
 
 /** Single activity row in expanded view */
-function ActivityRow({ activity, onOpenDetails, isLastChild, sessionFolderPath }: ActivityRowProps) {
+function ActivityRow({ activity, onOpenDetails, isLastChild, sessionFolderPath, displayMode = 'detailed' }: ActivityRowProps) {
   const depth = activity.depth || 0
 
   // Intermediate messages (LLM commentary) - render with dashed circle icon
@@ -632,16 +795,35 @@ function ActivityRow({ activity, onOpenDetails, isLastChild, sessionFolderPath }
 
   // Tool activities - show with status icon
   // Format: "[DisplayName] · [Intent/Description] [Params]"
-  // - DisplayName: LLM-generated (activity.displayName) or fallback to formatted toolName
+  // - DisplayName: From toolDisplayMeta (embedded in message) or LLM-generated or fallback
   // - Intent: For MCP tools (activity.intent), for Bash (toolInput.description)
   // - Params: Remaining tool input summary
-  const toolName = activity.displayName
-    || (activity.toolName ? getToolDisplayName(activity.toolName) : null)
+  const toolDisplay = formatToolDisplay(activity)
+  const fullDisplayName = toolDisplay.name
     || (activity.type === 'thinking' ? 'Thinking' : 'Processing')
+
+  // Detect MCP/API tools (toolName starts with "mcp__")
+  const isMcpOrApiTool = activity.toolName?.startsWith('mcp__') ?? false
+
+  // For MCP/API tools, extract source name and tool slug
+  // e.g., "ClickUp: clickup_search" -> sourceName="ClickUp", toolSlug="clickup_search"
+  let sourceName = fullDisplayName
+  let toolSlug: string | undefined = undefined
+  if (isMcpOrApiTool) {
+    const colonIndex = fullDisplayName.indexOf(':')
+    if (colonIndex > 0) {
+      sourceName = fullDisplayName.substring(0, colonIndex).trim()
+      toolSlug = fullDisplayName.substring(colonIndex + 1).trim()
+    }
+  }
+
+  // For non-MCP tools or informative mode, use the appropriate display name
+  const displayedName = isMcpOrApiTool ? sourceName : fullDisplayName
 
   // Intent for MCP tools, description for Bash commands
   const intentOrDescription = activity.intent || (activity.toolInput?.description as string | undefined)
   const inputSummary = formatToolInput(activity.toolInput, activity.toolName, sessionFolderPath)
+  const diffStats = computeEditWriteDiffStats(activity.toolName, activity.toolInput)
   const isComplete = activity.status === 'completed' || activity.status === 'error'
   const isBackgrounded = activity.status === 'backgrounded'
 
@@ -664,9 +846,120 @@ function ActivityRow({ activity, onOpenDetails, isLastChild, sessionFolderPath }
         )}
         onClick={onOpenDetails && isComplete ? onOpenDetails : undefined}
       >
-        <ActivityStatusIcon status={activity.status} toolName={activity.toolName} />
-        {/* Tool name (always shown, darker) - underlined when clickable */}
-        <span className={cn("shrink-0", onOpenDetails && isComplete && "group-hover/row:underline")}>{toolName}</span>
+        <ActivityStatusIcon status={activity.status} toolName={activity.toolName} customIcon={toolDisplay.icon} />
+        {/* MCP/API tools: Source name (shrink-0) then error badge (if any) then compound label (flex-1) */}
+        {isMcpOrApiTool && !isBackgrounded && (
+          <>
+            <span className="shrink-0">{sourceName}</span>
+            {/* Error badge for MCP/API tools */}
+            {activity.status === 'error' && activity.error && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span
+                    className="px-1.5 py-0.5 bg-[color-mix(in_oklab,var(--destructive)_4%,var(--background))] shadow-tinted rounded-[4px] text-[10px] text-destructive font-medium cursor-default shrink-0"
+                    style={{ '--shadow-color': 'var(--destructive-rgb)' } as React.CSSProperties}
+                  >
+                    Error
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="top" className="max-w-[400px]">
+                  {activity.error}
+                </TooltipContent>
+              </Tooltip>
+            )}
+            {(intentOrDescription || (displayMode === 'detailed' && (toolSlug || inputSummary))) && (
+              <span className={cn("truncate flex-1 min-w-0", onOpenDetails && isComplete && "group-hover/row:underline")}>
+                {intentOrDescription && (
+                  <>
+                    <span className="opacity-60"> · </span>
+                    <span>{intentOrDescription}</span>
+                  </>
+                )}
+                {displayMode === 'detailed' && toolSlug && (
+                  <>
+                    <span className="opacity-60"> · </span>
+                    <span className="opacity-70">{toolSlug}</span>
+                  </>
+                )}
+                {displayMode === 'detailed' && inputSummary && (
+                  <>
+                    <span className="opacity-60"> · </span>
+                    <span className="opacity-50">{inputSummary}</span>
+                  </>
+                )}
+              </span>
+            )}
+          </>
+        )}
+        {/* Native tools: Tool name (shrink-0) */}
+        {!isMcpOrApiTool && (
+          <span className={cn("shrink-0", onOpenDetails && isComplete && "group-hover/row:underline")}>{displayedName}</span>
+        )}
+        {/* Diff stats and filename badges - after tool name */}
+        {!isMcpOrApiTool && !isBackgrounded && diffStats && (
+          <span className="flex items-center gap-1.5 text-[10px] shrink-0">
+            {diffStats.deletions > 0 && (
+              <span
+                className="px-1.5 py-0.5 bg-[color-mix(in_oklab,var(--destructive)_5%,var(--background))] shadow-tinted rounded-[4px] text-destructive"
+                style={{ '--shadow-color': 'var(--destructive-rgb)' } as React.CSSProperties}
+              >{diffStats.deletions}</span>
+            )}
+            {diffStats.additions > 0 && (
+              <span
+                className="px-1.5 py-0.5 bg-[color-mix(in_oklab,var(--success)_5%,var(--background))] shadow-tinted rounded-[4px] text-success"
+                style={{ '--shadow-color': 'var(--success-rgb)' } as React.CSSProperties}
+              >{diffStats.additions}</span>
+            )}
+            {/* Filename badge */}
+            {activity.toolInput?.file_path && (
+              <span className="px-1.5 py-0.5 bg-background shadow-minimal rounded-[4px] text-[11px] text-foreground/70">
+                {(activity.toolInput.file_path as string).split('/').pop()}
+              </span>
+            )}
+          </span>
+        )}
+        {/* Filename badge for Read tool (no diff stats) */}
+        {!isMcpOrApiTool && !isBackgrounded && !diffStats && activity.toolName === 'Read' && activity.toolInput?.file_path && (
+          <span className="flex items-center gap-1.5 text-[10px] shrink-0">
+            <span className="px-1.5 py-0.5 bg-background shadow-minimal rounded-[4px] text-[11px] text-foreground/70">
+              {(activity.toolInput.file_path as string).split('/').pop()}
+            </span>
+          </span>
+        )}
+        {/* Error badge for native tools */}
+        {!isMcpOrApiTool && activity.status === 'error' && activity.error && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span
+                className="px-1.5 py-0.5 bg-[color-mix(in_oklab,var(--destructive)_4%,var(--background))] shadow-tinted rounded-[4px] text-[10px] text-destructive font-medium cursor-default shrink-0"
+                style={{ '--shadow-color': 'var(--destructive-rgb)' } as React.CSSProperties}
+              >
+                Error
+              </span>
+            </TooltipTrigger>
+            <TooltipContent side="top" className="max-w-[400px]">
+              {activity.error}
+            </TooltipContent>
+          </Tooltip>
+        )}
+        {/* Native tools: Compound label with description + params (flex-1) */}
+        {/* In informative mode, hide inputSummary (command details) - only show description */}
+        {!isMcpOrApiTool && !isBackgrounded && (intentOrDescription || (displayMode === 'detailed' && inputSummary)) && (
+          <span className={cn("truncate flex-1 min-w-0", onOpenDetails && isComplete && "group-hover/row:underline")}>
+            {intentOrDescription && (
+              <>
+                <span className="opacity-60"> · </span>
+                <span>{intentOrDescription}</span>
+              </>
+            )}
+            {displayMode === 'detailed' && inputSummary && (
+              <>
+                <span className="opacity-60"> · </span>
+                <span className="opacity-50">{inputSummary}</span>
+              </>
+            )}
+          </span>
+        )}
         {/* Background task info (task/shell ID + elapsed time) */}
         {backgroundInfo && (
           <>
@@ -674,25 +967,7 @@ function ActivityRow({ activity, onOpenDetails, isLastChild, sessionFolderPath }
             <span className="truncate min-w-0 max-w-[300px] text-accent">{backgroundInfo}</span>
           </>
         )}
-        {/* Intent/description if available (darker, after interpunct) - skip for backgrounded tasks */}
-        {!isBackgrounded && intentOrDescription && (
-          <>
-            <span className="opacity-60 shrink-0">·</span>
-            <span className="truncate min-w-0 max-w-[300px]">{intentOrDescription}</span>
-          </>
-        )}
-        {/* Additional params (lighter) - skip for backgrounded tasks */}
-        {!isBackgrounded && inputSummary && (
-          <span className="opacity-50 truncate min-w-0">{inputSummary}</span>
-        )}
-        {activity.status === 'error' && activity.error && (
-          <>
-            <span className="text-destructive/60 shrink-0">·</span>
-            <span className="text-destructive truncate min-w-[120px] max-w-[300px]">{activity.error}</span>
-          </>
-        )}
-        {/* Spacer to push details button to right */}
-        <span className="flex-1" />
+        {/* No spacer needed - both MCP/API and native tools now have flex-1 on their compound spans */}
         {/* Open details button */}
         {onOpenDetails && isComplete && (
           <div
@@ -737,13 +1012,15 @@ interface ActivityGroupRowProps {
   animationIndex?: number
   /** Session folder path for stripping from file paths in tool display */
   sessionFolderPath?: string
+  /** Display mode: 'detailed' shows all info, 'informative' hides MCP/API names and params */
+  displayMode?: 'informative' | 'detailed'
 }
 
 /**
  * Renders a Task subagent with its child activities grouped together.
  * Provides visual containment and collapsible children.
  */
-function ActivityGroupRow({ group, expandedGroups: externalExpandedGroups, onExpandedGroupsChange, onOpenActivityDetails, animationIndex = 0, sessionFolderPath }: ActivityGroupRowProps) {
+function ActivityGroupRow({ group, expandedGroups: externalExpandedGroups, onExpandedGroupsChange, onOpenActivityDetails, animationIndex = 0, sessionFolderPath, displayMode = 'detailed' }: ActivityGroupRowProps) {
   // Use local state if no controlled state provided
   const [localExpandedGroups, setLocalExpandedGroups] = useState<Set<string>>(new Set())
   const expandedGroups = externalExpandedGroups ?? localExpandedGroups
@@ -882,6 +1159,7 @@ function ActivityGroupRow({ group, expandedGroups: externalExpandedGroups, onExp
                     onOpenDetails={onOpenActivityDetails ? () => onOpenActivityDetails(child) : undefined}
                     isLastChild={idx === group.children.length - 1}
                     sessionFolderPath={sessionFolderPath}
+                    displayMode={displayMode}
                   />
                 </motion.div>
               ))}
@@ -920,7 +1198,11 @@ export interface ResponseCardProps {
   isLastResponse?: boolean
   /** Whether to show the Accept Plan button (default: true) */
   showAcceptPlan?: boolean
+  /** Hide footer for compact embedding (EditPopover) */
+  compactMode?: boolean
 }
+
+const MAX_HEIGHT = 540
 
 /**
  * ResponseCard - Unified card component for AI responses and plans
@@ -950,6 +1232,7 @@ export function ResponseCard({
   onAcceptWithCompact,
   isLastResponse = true,
   showAcceptPlan = true,
+  compactMode = false,
 }: ResponseCardProps) {
   // Throttled content for display - updates every CONTENT_THROTTLE_MS during streaming
   const [displayedText, setDisplayedText] = useState(text)
@@ -1023,8 +1306,6 @@ export function ResponseCard({
     return null
   }
 
-  const MAX_HEIGHT = 540
-
   // Completed response or plan - show with max height and footer
   if (isCompleted || variant === 'plan') {
     const isPlan = variant === 'plan'
@@ -1081,68 +1362,70 @@ export function ResponseCard({
             </Markdown>
           </div>
 
-          {/* Footer with actions */}
-          <div className={cn(
-            "pl-4 pr-2.5 py-2 border-t border-border/30 flex items-center justify-between bg-muted/20",
-            SIZE_CONFIG.fontSize
-          )}>
-            {/* Left side - Copy and View as Markdown */}
-            <div className="flex items-center gap-3">
-              <button
-                onClick={handleCopy}
-                className={cn(
-                  "flex items-center gap-1.5 transition-colors select-none",
-                  copied ? "text-success" : "text-muted-foreground hover:text-foreground",
-                  "focus:outline-none focus-visible:underline"
-                )}
-              >
-                {copied ? (
-                  <>
-                    <Check className={SIZE_CONFIG.iconSize} />
-                    <span>Copied!</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className={SIZE_CONFIG.iconSize} />
-                    <span>Copy</span>
-                  </>
-                )}
-              </button>
-              {onPopOut && (
+          {/* Footer with actions - hidden in compact mode */}
+          {!compactMode && (
+            <div className={cn(
+              "pl-4 pr-2.5 py-2 border-t border-border/30 flex items-center justify-between bg-muted/20",
+              SIZE_CONFIG.fontSize
+            )}>
+              {/* Left side - Copy and View as Markdown */}
+              <div className="flex items-center gap-3">
                 <button
-                  onClick={onPopOut}
+                  onClick={handleCopy}
                   className={cn(
                     "flex items-center gap-1.5 transition-colors select-none",
-                    "text-muted-foreground hover:text-foreground",
+                    copied ? "text-success" : "text-muted-foreground hover:text-foreground",
                     "focus:outline-none focus-visible:underline"
                   )}
                 >
-                  <ExternalLink className={SIZE_CONFIG.iconSize} />
-                  <span>View as Markdown</span>
+                  {copied ? (
+                    <>
+                      <Check className={SIZE_CONFIG.iconSize} />
+                      <span>Copied!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className={SIZE_CONFIG.iconSize} />
+                      <span>Copy</span>
+                    </>
+                  )}
                 </button>
+                {onPopOut && (
+                  <button
+                    onClick={onPopOut}
+                    className={cn(
+                      "flex items-center gap-1.5 transition-colors select-none",
+                      "text-muted-foreground hover:text-foreground",
+                      "focus:outline-none focus-visible:underline"
+                    )}
+                  >
+                    <ExternalLink className={SIZE_CONFIG.iconSize} />
+                    <span>View as Markdown</span>
+                  </button>
+                )}
+              </div>
+
+              {/* Right side - Accept Plan dropdown (only shown for plan variant when it's the last response) */}
+              {isPlan && showAcceptPlan && onAccept && onAcceptWithCompact && (
+                <div
+                  className={cn(
+                    "flex items-center gap-3 transition-all duration-200",
+                    isLastResponse
+                      ? "opacity-100 translate-x-0"
+                      : "opacity-0 translate-x-2 pointer-events-none"
+                  )}
+                >
+                  <span className="text-xs text-muted-foreground">
+                    Type your feedback in chat or
+                  </span>
+                  <AcceptPlanDropdown
+                    onAccept={onAccept}
+                    onAcceptWithCompact={onAcceptWithCompact}
+                  />
+                </div>
               )}
             </div>
-
-            {/* Right side - Accept Plan dropdown (only shown for plan variant when it's the last response) */}
-            {isPlan && showAcceptPlan && onAccept && onAcceptWithCompact && (
-              <div
-                className={cn(
-                  "flex items-center gap-3 transition-all duration-200",
-                  isLastResponse
-                    ? "opacity-100 translate-x-0"
-                    : "opacity-0 translate-x-2 pointer-events-none"
-                )}
-              >
-                <span className="text-xs text-muted-foreground">
-                  Type your feedback in chat or
-                </span>
-                <AcceptPlanDropdown
-                  onAccept={onAccept}
-                  onAcceptWithCompact={onAcceptWithCompact}
-                />
-              </div>
-            )}
-          </div>
+          )}
         </div>
 
         {/* Fullscreen overlay for reading response/plan */}
@@ -1183,13 +1466,15 @@ export function ResponseCard({
         </Markdown>
       </div>
 
-      {/* Footer */}
-      <div className={cn("px-4 py-2 border-t border-border/30 flex items-center bg-muted/20", SIZE_CONFIG.fontSize)}>
-        <div className="flex items-center gap-2 text-muted-foreground">
-          <Spinner className={SIZE_CONFIG.spinnerSize} />
-          <span>Streaming...</span>
+      {/* Footer - hidden in compact mode */}
+      {!compactMode && (
+        <div className={cn("px-4 py-2 border-t border-border/30 flex items-center bg-muted/20", SIZE_CONFIG.fontSize)}>
+          <div className="flex items-center gap-2 text-muted-foreground">
+            <Spinner className={SIZE_CONFIG.spinnerSize} />
+            <span>Streaming...</span>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   )
 }
@@ -1310,6 +1595,9 @@ export const TurnCard = React.memo(function TurnCard({
   onAcceptPlanWithCompact,
   isLastResponse,
   sessionFolderPath,
+  displayMode = 'detailed',
+  animateResponse = false,
+  compactMode = false,
 }: TurnCardProps) {
   // Derive the turn phase from props using the state machine.
   // This provides a single source of truth for lifecycle state,
@@ -1328,7 +1616,17 @@ export const TurnCard = React.memo(function TurnCard({
   const [localExpandedTurns, setLocalExpandedTurns] = useState<Set<string>>(() => defaultExpanded ? new Set([turnId]) : new Set())
   const isExpanded = externalIsExpanded ?? localExpandedTurns.has(turnId)
 
+  // Track if user has toggled expansion (skip animation on initial mount)
+  const hasUserToggled = useRef(false)
+
+  // Track if component has mounted (enable fade-in for new activities after mount)
+  const hasMounted = useRef(false)
+  useEffect(() => {
+    hasMounted.current = true
+  }, [])
+
   const toggleExpanded = useCallback(() => {
+    hasUserToggled.current = true
     const newExpanded = !isExpanded
     if (onExpandedChange) {
       onExpandedChange(newExpanded)
@@ -1425,9 +1723,9 @@ export const TurnCard = React.memo(function TurnCard({
 
   return (
     <div className="space-y-1">
-      {/* Activity Section */}
+      {/* Activity Section - excluded from search highlighting (matches ripgrep behavior) */}
       {hasActivities && (
-        <div className="group select-none">
+        <div className="group select-none" data-search-exclude="true">
           {/* Collapsed Header / Toggle */}
           <button
             onClick={toggleExpanded}
@@ -1506,6 +1804,7 @@ export const TurnCard = React.memo(function TurnCard({
                       : undefined
                   }}
                 >
+                  <AnimatePresence mode="sync">
                   {/* Grouped view for Task subagents */}
                   {groupedActivities ? (
                     groupedActivities.map((item, index) => (
@@ -1518,18 +1817,24 @@ export const TurnCard = React.memo(function TurnCard({
                           onOpenActivityDetails={onOpenActivityDetails}
                           animationIndex={index}
                           sessionFolderPath={sessionFolderPath}
+                          displayMode={displayMode}
                         />
                       ) : (
                         <motion.div
                           key={item.id}
-                          initial={{ opacity: 0, x: -8 }}
+                          initial={
+                            hasUserToggled.current || hasMounted.current
+                              ? { opacity: 0, x: -8 }
+                              : false
+                          }
                           animate={{ opacity: 1, x: 0 }}
-                          transition={{ delay: index < SIZE_CONFIG.staggeredAnimationLimit ? index * 0.03 : 0.3 }}
+                          transition={{ delay: hasUserToggled.current && index < SIZE_CONFIG.staggeredAnimationLimit ? index * 0.03 : 0 }}
                         >
                           <ActivityRow
                             activity={item}
                             onOpenDetails={onOpenActivityDetails ? () => onOpenActivityDetails(item) : undefined}
                             sessionFolderPath={sessionFolderPath}
+                            displayMode={displayMode}
                           />
                         </motion.div>
                       )
@@ -1539,33 +1844,43 @@ export const TurnCard = React.memo(function TurnCard({
                     sortedActivities.map((activity, index) => (
                       <motion.div
                         key={activity.id}
-                        initial={{ opacity: 0, x: -8 }}
+                        initial={
+                          hasUserToggled.current || hasMounted.current
+                            ? { opacity: 0, x: -8 }
+                            : false
+                        }
                         animate={{ opacity: 1, x: 0 }}
-                        // Only first 10 items get staggered delay, rest appear simultaneously
-                        transition={{ delay: index < SIZE_CONFIG.staggeredAnimationLimit ? index * 0.03 : 0.3 }}
+                        // Only animate on user toggle, not initial mount
+                        transition={{ delay: hasUserToggled.current && index < SIZE_CONFIG.staggeredAnimationLimit ? index * 0.03 : 0 }}
                       >
                         <ActivityRow
                           activity={activity}
                           onOpenDetails={onOpenActivityDetails ? () => onOpenActivityDetails(activity) : undefined}
                           isLastChild={lastChildSet.has(activity.id)}
                           sessionFolderPath={sessionFolderPath}
+                          displayMode={displayMode}
                         />
                       </motion.div>
                     ))
                   )}
                   {/* Thinking/Buffering indicator - shown while waiting for response */}
-                  {isThinking && (
+                  {isThinking && !animateResponse && (
                     <motion.div
                       key="thinking"
                       initial={{ opacity: 0, x: -8 }}
                       animate={{ opacity: 1, x: 0 }}
-                      transition={{ delay: Math.min(sortedActivities.length, SIZE_CONFIG.staggeredAnimationLimit) * 0.03 }}
+                      transition={{
+                        delay: Math.min(sortedActivities.length, SIZE_CONFIG.staggeredAnimationLimit) * 0.03,
+                        duration: 0.3,
+                        ease: "easeOut"
+                      }}
                       className={cn("flex items-center gap-2 py-0.5 text-muted-foreground/70", SIZE_CONFIG.fontSize)}
                     >
                       <Spinner className={SIZE_CONFIG.spinnerSize} />
                       <span>{isBuffering ? 'Preparing response...' : 'Thinking...'}</span>
                     </motion.div>
                   )}
+                  </AnimatePresence>
                 </div>
                 {/* TodoList - inside expanded section */}
                 {todos && todos.length > 0 && (
@@ -1578,7 +1893,7 @@ export const TurnCard = React.memo(function TurnCard({
       )}
 
       {/* Standalone thinking indicator - when no activities but still working */}
-      {!hasActivities && isThinking && (
+      {!hasActivities && isThinking && !animateResponse && (
         <div className={cn("flex items-center gap-2 px-3 py-1.5 text-muted-foreground", SIZE_CONFIG.fontSize)}>
           <Spinner className={SIZE_CONFIG.spinnerSize} />
           <span>{isBuffering ? 'Preparing response...' : 'Thinking...'}</span>
@@ -1586,7 +1901,35 @@ export const TurnCard = React.memo(function TurnCard({
       )}
 
       {/* Response Section - only shown when not buffering */}
-      {response && !isBuffering && (
+      {/* Animated version for playground demos */}
+      {animateResponse && (
+        <AnimatePresence>
+          {response && !isBuffering && (
+            <motion.div
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.3, ease: "easeOut" }}
+              className={cn("select-text", hasActivities && "mt-2")}
+            >
+              <ResponseCard
+                text={response.text}
+                isStreaming={response.isStreaming}
+                streamStartTime={response.streamStartTime}
+                onOpenFile={onOpenFile}
+                onOpenUrl={onOpenUrl}
+                onPopOut={onPopOut ? () => onPopOut(response.text) : undefined}
+                variant={response.isPlan ? 'plan' : 'response'}
+                onAccept={onAcceptPlan}
+                onAcceptWithCompact={onAcceptPlanWithCompact}
+                isLastResponse={isLastResponse}
+                compactMode={compactMode}
+              />
+            </motion.div>
+          )}
+        </AnimatePresence>
+      )}
+      {/* Non-animated version for regular app use */}
+      {!animateResponse && response && !isBuffering && (
         <div className={cn("select-text", hasActivities && "mt-2")}>
           <ResponseCard
             text={response.text}
@@ -1599,6 +1942,7 @@ export const TurnCard = React.memo(function TurnCard({
             onAccept={onAcceptPlan}
             onAcceptWithCompact={onAcceptPlanWithCompact}
             isLastResponse={isLastResponse}
+            compactMode={compactMode}
           />
         </div>
       )}
@@ -1620,6 +1964,12 @@ export const TurnCard = React.memo(function TurnCard({
 
   // Re-render if isLastResponse changed (for Accept Plan button visibility)
   if (prev.isLastResponse !== next.isLastResponse) return false
+
+  // Re-render if displayMode changed
+  if (prev.displayMode !== next.displayMode) return false
+
+  // Re-render if activities changed (important for playground/testing scenarios)
+  if (prev.activities !== next.activities) return false
 
   // For complete, non-streaming turns: skip re-render if same turn
   // These are static and safe to cache

@@ -10,6 +10,7 @@ import * as React from 'react'
 import { createContext, useContext, useCallback } from 'react'
 import { useAtomValue } from 'jotai'
 import type { RichTextInputHandle } from '@/components/ui/rich-text-input'
+import type { ChatDisplayHandle } from '@/components/app-shell/ChatDisplay'
 import type {
   Session,
   Workspace,
@@ -36,6 +37,8 @@ export interface AppShellContextType {
   workspaces: Workspace[]
   activeWorkspaceId: string | null
   currentModel: string
+  /** When set, a custom model overrides the Anthropic model selector (e.g. OpenRouter) */
+  customModel: string | null
   pendingPermissions: Map<string, PermissionRequest[]>
   pendingCredentials: Map<string, CredentialRequest[]>
   /** Get draft input text for a session - reads from ref without triggering re-renders */
@@ -44,6 +47,10 @@ export interface AppShellContextType {
   enabledSources?: LoadedSource[]
   /** All skills for this workspace - provided by AppShell component (for @mentions) */
   skills?: LoadedSkill[]
+  /** All label configs (tree) for label menu and badge display */
+  labels?: import('@craft-agent/shared/labels').LabelConfig[]
+  /** Callback when session labels change */
+  onSessionLabelsChange?: (sessionId: string, labels: string[]) => void
   /** Enabled permission modes for Shift+Tab cycling */
   enabledModes?: PermissionMode[]
   /** Dynamic todo states from workspace config (provided by AppShell, defaults to empty) */
@@ -54,13 +61,15 @@ export interface AppShellContextType {
   sessionOptions: Map<string, SessionOptions>
 
   // Session callbacks
-  onCreateSession: (workspaceId: string) => Promise<Session>
-  onSendMessage: (sessionId: string, message: string, attachments?: FileAttachment[], skillSlugs?: string[]) => void
+  onCreateSession: (workspaceId: string, options?: import('../../shared/types').CreateSessionOptions) => Promise<Session>
+  onSendMessage: (sessionId: string, message: string, attachments?: FileAttachment[], skillSlugs?: string[], badges?: import('@craft-agent/core').ContentBadge[]) => void
   onRenameSession: (sessionId: string, name: string) => void
   onFlagSession: (sessionId: string) => void
   onUnflagSession: (sessionId: string) => void
   onMarkSessionRead: (sessionId: string) => void
   onMarkSessionUnread: (sessionId: string) => void
+  /** Track which session user is viewing (for unread state machine) */
+  onSetActiveViewingSession: (sessionId: string) => void
   onTodoStateChange: (sessionId: string, state: TodoState) => void
   onDeleteSession: (sessionId: string, skipConfirmation?: boolean) => Promise<boolean>
 
@@ -85,6 +94,8 @@ export interface AppShellContextType {
 
   // Model
   onModelChange: (model: string) => void
+  /** Re-fetch custom model from billing config (call after API connection changes) */
+  refreshCustomModel: () => Promise<void>
 
   // Workspace
   onSelectWorkspace: (id: string, openInNewWindow?: boolean) => void
@@ -113,6 +124,18 @@ export interface AppShellContextType {
 
   // Right sidebar button (for page headers)
   rightSidebarButton?: React.ReactNode
+
+  // Session list search state (for ChatDisplay highlighting)
+  /** Current search query from session list - used to highlight matches in ChatDisplay */
+  sessionListSearchQuery?: string
+  /** Whether search mode is active (prevents focus stealing to chat input even with empty query) */
+  isSearchModeActive?: boolean
+  /** Callback to update session list search query */
+  setSessionListSearchQuery?: (query: string) => void
+  /** Ref to ChatDisplay for navigation between matches */
+  chatDisplayRef?: React.RefObject<ChatDisplayHandle>
+  /** Callback when ChatDisplay match info changes (for immediate UI updates) */
+  onChatMatchInfoChange?: (info: { count: number; index: number }) => void
 }
 
 const AppShellContext = createContext<AppShellContextType | null>(null)
@@ -125,6 +148,11 @@ export function AppShellProvider({
   value: AppShellContextType
 }) {
   return <AppShellContext.Provider value={value}>{children}</AppShellContext.Provider>
+}
+
+/** Returns context or null if outside provider (safe for optional consumers like playground) */
+export function useOptionalAppShellContext(): AppShellContextType | null {
+  return useContext(AppShellContext)
 }
 
 export function useAppShellContext(): AppShellContextType {

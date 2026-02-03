@@ -105,7 +105,7 @@ export function inferSlackServiceFromUrl(baseUrl: string | undefined): SlackServ
 /**
  * Infer Microsoft service from API baseUrl.
  * Microsoft Graph API uses graph.microsoft.com for all services.
- * Returns 'outlook' by default if URL matches Microsoft Graph pattern.
+ * Returns undefined if service cannot be determined from URL path.
  */
 export function inferMicrosoftServiceFromUrl(baseUrl: string | undefined): MicrosoftService | undefined {
   if (!baseUrl) return undefined;
@@ -138,8 +138,8 @@ export function inferMicrosoftServiceFromUrl(baseUrl: string | undefined): Micro
     if (pathname.includes('/sites')) {
       return 'sharepoint';
     }
-    // Default to outlook for general Graph API access
-    return 'outlook';
+    // Cannot determine service from generic Graph URL - require explicit microsoftService config
+    return undefined;
   }
 
   // Match Outlook-specific API (legacy, but still used)
@@ -365,6 +365,12 @@ export interface LoadedSource {
    * Built-in sources are always available and not shown in the sources UI.
    */
   isBuiltin?: boolean;
+
+  /**
+   * Pre-computed path to local icon file (icon.svg, icon.png, etc.) if it exists.
+   * Computed during source loading so renderer doesn't need filesystem access.
+   */
+  iconPath?: string;
 }
 
 /**

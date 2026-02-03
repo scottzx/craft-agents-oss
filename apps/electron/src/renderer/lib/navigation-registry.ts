@@ -158,8 +158,11 @@ export const NavigationRegistry = {
     displayName: 'Settings',
     detailsPages: {
       app: PlaceholderComponent, // AppSettingsPage
+      appearance: PlaceholderComponent, // AppearanceSettingsPage
+      input: PlaceholderComponent, // InputSettingsPage
       workspace: PlaceholderComponent, // WorkspaceSettingsPage
       permissions: PlaceholderComponent, // PermissionsSettingsPage
+      labels: PlaceholderComponent, // LabelsSettingsPage
       shortcuts: PlaceholderComponent, // ShortcutsPage
       preferences: PlaceholderComponent, // PreferencesPage
     },
